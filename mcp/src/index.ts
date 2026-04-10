@@ -6,281 +6,32 @@
  *  - Generate GCScript dapp connections (JSON)
  *  - Encode GCScript into wallet-ready URLs
  *  - Decode wallet response URLs
- *  - Query documentation and example patterns
+ *  - Browse and retrieve the 90+ built-in examples
+ *  - Query documentation and reference patterns
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+import {
+  encodeGcScriptUrl,
+  decodeGcResult,
+  validateGcScript,
+  buildSendAdaScript,
+  buildGetWalletInfoScript,
+  buildMintTokenScript,
+  buildMultiSendScript,
+  buildStakeDelegationScript,
+} from "./lib.js";
 
-const GC_API_BASE = "https://wallet.gamechanger.finance/api/2/run/";
-
-/**
- * Encode a GCScript object into a base64url wallet URL (no compression).
- * This matches the "0-" (base64url, no gzip) encoding supported by GCW v2.
- */
-function encodeGcScriptUrl(gcScript: unknown, network: string): string {
-  const json = JSON.stringify(gcScript);
-  // Node-native base64url (no external deps needed)
-  const encoded = Buffer.from(json, "utf8").toString("base64url");
-  const payload = `0-${encoded}`;
-  return `${GC_API_BASE}${payload}?networkTag=${network}`;
-}
-
-/**
- * Decode a packed wallet result string (base64url or gzip) back to a JSON
- * string. Handles both "0-" (base64url) and "1-" (gzip) prefixes.
- */
-async function decodeGcResult(packed: string): Promise<unknown> {
-  if (packed.startsWith("0-")) {
-    const b64 = packed.slice(2);
-    const json = Buffer.from(b64, "base64url").toString("utf8");
-    return JSON.parse(json);
-  }
-  if (packed.startsWith("1-")) {
-    const b64 = packed.slice(2);
-    const compressed = Buffer.from(b64, "base64url");
-    // Use Node built-in zlib
-    const { gunzip } = await import("node:zlib");
-    const { promisify } = await import("node:util");
-    const gunzipAsync = promisify(gunzip);
-    const decompressed = await gunzipAsync(compressed);
-    return JSON.parse(decompressed.toString("utf8"));
-  }
-  throw new Error("Unsupported encoding prefix. Expected '0-' (base64url) or '1-' (gzip).");
-}
-
-// ---------------------------------------------------------------------------
-// GCScript template builders
-// ---------------------------------------------------------------------------
-
-function buildSendAdaScript(params: {
-  toAddress: string;
-  lovelace: string;
-  title?: string;
-  returnUrl?: string;
-}): object {
-  const script: Record<string, unknown> = {
-    type: "script",
-    title: params.title ?? "Send ADA",
-    description: "Send ADA to an address on Cardano.",
-    exportAs: "sendAdaResult",
-    return: { mode: "last" },
-    run: {
-      build: {
-        type: "buildTx",
-        tx: {
-          outputs: [
-            {
-              address: params.toAddress,
-              assets: [
-                {
-                  policyId: "ada",
-                  assetName: "ada",
-                  quantity: params.lovelace,
-                },
-              ],
-            },
-          ],
-        },
-      },
-      sign: {
-        type: "signTxs",
-        detailedPermissions: false,
-        txs: ["{get('cache.build.txHex')}"],
-      },
-      submit: {
-        type: "submitTxs",
-        txs: "{get('cache.sign')}",
-      },
-      txHash: {
-        type: "macro",
-        run: "{get('cache.build.txHash')}",
-      },
-    },
-  };
-
-  if (params.returnUrl) {
-    (script as Record<string, unknown>)["returnURLPattern"] = params.returnUrl;
-  }
-
-  return script;
-}
-
-function buildGetWalletInfoScript(): object {
-  return {
-    type: "script",
-    title: "Get Wallet Info",
-    description: "Retrieve wallet name, current address, and network info.",
-    exportAs: "walletInfo",
-    run: {
-      name: { type: "getName" },
-      address: { type: "getCurrentAddress" },
-      network: { type: "getNetworkInfo" },
-    },
-  };
-}
-
-function buildMintTokenScript(params: {
-  assetName: string;
-  quantity: string;
-  toAddress?: string;
-  metadata?: Record<string, unknown>;
-}): object {
-  const mintScript: Record<string, unknown> = {
-    type: "script",
-    title: `Mint ${params.quantity} ${params.assetName}`,
-    description: "Mint native tokens using the user's spending key as minting policy.",
-    exportAs: "mintResult",
-    return: { mode: "last" },
-    run: {
-      dependencies: {
-        type: "script",
-        run: {
-          issuer: { type: "getSpendingPublicKey" },
-          mintingPolicy: {
-            type: "nativeScript",
-            script: {
-              pubKeyHashHex: "{get('cache.dependencies.issuer.pubKeyHashHex')}",
-            },
-          },
-        },
-      },
-      build: {
-        type: "buildTx",
-        tx: {
-          mints: [
-            {
-              vkey: "{get('cache.dependencies.issuer.pubKeyHashHex')}",
-              script: "{get('cache.dependencies.mintingPolicy.scriptHashHex')}",
-              assets: [
-                {
-                  assetName: params.assetName,
-                  quantity: params.quantity,
-                },
-              ],
-            },
-          ],
-          outputs: [
-            {
-              address:
-                params.toAddress ?? "{get('cache.dependencies.issuer.address')}",
-              assets: [
-                {
-                  policyId:
-                    "{get('cache.dependencies.mintingPolicy.scriptHashHex')}",
-                  assetName: params.assetName,
-                  quantity: params.quantity,
-                },
-              ],
-            },
-          ],
-          ...(params.metadata
-            ? {
-                auxiliaryData: params.metadata,
-              }
-            : {}),
-        },
-      },
-      sign: {
-        type: "signTxs",
-        detailedPermissions: false,
-        txs: ["{get('cache.build.txHex')}"],
-      },
-      submit: {
-        type: "submitTxs",
-        txs: "{get('cache.sign')}",
-      },
-      txHash: {
-        type: "macro",
-        run: "{get('cache.build.txHash')}",
-      },
-    },
-  };
-
-  return mintScript;
-}
-
-function buildMultiSendScript(
-  outputs: Array<{ address: string; lovelace: string }>
-): object {
-  return {
-    type: "script",
-    title: "Multi-recipient ADA payment",
-    description: "Send ADA to multiple addresses in a single transaction.",
-    exportAs: "multiSendResult",
-    return: { mode: "last" },
-    run: {
-      build: {
-        type: "buildTx",
-        tx: {
-          outputs: outputs.map((o) => ({
-            address: o.address,
-            assets: [
-              { policyId: "ada", assetName: "ada", quantity: o.lovelace },
-            ],
-          })),
-        },
-      },
-      sign: {
-        type: "signTxs",
-        detailedPermissions: false,
-        txs: ["{get('cache.build.txHex')}"],
-      },
-      submit: {
-        type: "submitTxs",
-        txs: "{get('cache.sign')}",
-      },
-      txHash: {
-        type: "macro",
-        run: "{get('cache.build.txHash')}",
-      },
-    },
-  };
-}
-
-function buildStakeDelegationScript(poolId: string): object {
-  return {
-    type: "script",
-    title: "Delegate Stake",
-    description: `Delegate staking key to pool ${poolId}.`,
-    exportAs: "delegationResult",
-    return: { mode: "last" },
-    run: {
-      build: {
-        type: "buildTx",
-        tx: {
-          certificates: [
-            {
-              type: "stakeKeyRegistration",
-            },
-            {
-              type: "stakeDelegation",
-              poolId,
-            },
-          ],
-        },
-      },
-      sign: {
-        type: "signTxs",
-        detailedPermissions: false,
-        txs: ["{get('cache.build.txHex')}"],
-      },
-      submit: {
-        type: "submitTxs",
-        txs: "{get('cache.sign')}",
-      },
-      txHash: {
-        type: "macro",
-        run: "{get('cache.build.txHash')}",
-      },
-    },
-  };
-}
+import {
+  listExamples,
+  getExampleByName,
+  searchExamples,
+  ALL_CATEGORIES,
+  type ExampleCategory,
+} from "./examples.js";
 
 // ---------------------------------------------------------------------------
 // MCP Server setup
@@ -463,10 +214,7 @@ server.tool(
       .describe("Optional return URL pattern with {result} placeholder."),
   },
   async ({ network, returnUrl }) => {
-    let script = buildGetWalletInfoScript() as Record<string, unknown>;
-    if (returnUrl) {
-      script = { ...script, returnURLPattern: returnUrl };
-    }
+    const script = buildGetWalletInfoScript({ returnUrl });
     const url = encodeGcScriptUrl(script, network);
     return {
       content: [
@@ -555,6 +303,131 @@ server.tool(
         {
           type: "text" as const,
           text: JSON.stringify({ gcscript: script, url, network }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: list_examples
+// ---------------------------------------------------------------------------
+server.tool(
+  "list_examples",
+  "List the 90+ built-in GCScript example dapps from the repository. Optionally filter by category.",
+  {
+    category: z
+      .enum(ALL_CATEGORIES as [ExampleCategory, ...ExampleCategory[]])
+      .optional()
+      .describe(
+        "Optional category filter. One of: " + ALL_CATEGORIES.join(", ")
+      ),
+  },
+  async ({ category }) => {
+    const examples = await listExamples(category);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              total: examples.length,
+              category: category ?? "all",
+              examples,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: get_example
+// ---------------------------------------------------------------------------
+server.tool(
+  "get_example",
+  "Retrieve a specific example by name. Returns the full GCScript JSON and an encoded wallet URL for immediate use.",
+  {
+    name: z
+      .string()
+      .describe(
+        "Example name (as returned by list_examples or search_examples). Case-insensitive."
+      ),
+    network: z
+      .enum(["mainnet", "preprod"])
+      .default("mainnet")
+      .describe("Target Cardano network for the encoded URL."),
+  },
+  async ({ name, network }) => {
+    const example = await getExampleByName(name);
+    if (!example) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `Example not found: "${name}". Use list_examples or search_examples to find available examples.`,
+          },
+        ],
+      };
+    }
+
+    const url = encodeGcScriptUrl(example.gcscript, network);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              name: example.name,
+              title: example.title,
+              description: example.description,
+              category: example.category,
+              gcscript: example.gcscript,
+              url,
+              network,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: search_examples
+// ---------------------------------------------------------------------------
+server.tool(
+  "search_examples",
+  "Search the built-in GCScript examples by keywords. Returns matching examples from name, title, and description.",
+  {
+    keywords: z
+      .array(z.string())
+      .min(1)
+      .describe(
+        "One or more search keywords (AND logic). Example: ['nft', 'mint'] returns examples mentioning both."
+      ),
+  },
+  async ({ keywords }) => {
+    const results = await searchExamples(keywords);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              keywords,
+              total: results.length,
+              results,
+            },
+            null,
+            2
+          ),
         },
       ],
     };
@@ -779,22 +652,20 @@ List workspace items: getAddresses, getKeys.`,
 
       examples: `# Example Dapps
 
-70+ open source GCScript example dapps live in the examples/ directory of this repo.
-Each example has: .gcscript, .html (with lib), .html (no lib), .md, .png.
+90+ open source GCScript example dapps are bundled with this MCP server.
+Use the list_examples, get_example, and search_examples tools to browse them.
 
-Categories include:
-- Payments (minimal, multi-output, pipeline)
-- NFT / Token Minting
-- Stake Delegation and Withdrawal
-- Multisig (Kobayashi Maru, Shared Treasury, Unimatrix)
-- Workspaces and Key Derivation
-- Governance (DRep, Vote Delegation)
-- Smart Contracts (Plutus V2/V3, Helios)
-- GCFS (On-chain file system)
-- CIP-8 Data Signing
-- Cryptographic / Arithmetic Macros
-- Gift Wallet Generation
-- Search, Import, Export demos`,
+Categories:
+- payments       — ADA payments, stake delegation/withdrawal, transaction features
+- minting        — NFT and native token minting/burning
+- multisig       — Multi-signature flows (Kobayashi Maru, Shared Treasury, Unimatrix)
+- governance     — DRep, Vote Delegation, Abstain, No Confidence
+- workspaces     — Workspace configuration, key/address management
+- smart-contracts — Plutus V2/V3, Helios Language, Lock-and-Redeem
+- gcfs           — On-chain file system (GCFS), Dandelion Network
+- wallet         — Gift wallets, wallet type detection, derivation scripts
+- keys           — Key derivation formats and paths
+- utility        — Macros, ISL, cryptographic operations, code validation`,
 
       skills: `See SKILLS.md at the root of this repository for a comprehensive AI agent skills reference covering GCScript, ISL, UDC, transactions, workspaces, patterns, and tooling.`,
     };
@@ -816,42 +687,9 @@ server.tool(
     gcscript: z.string().describe("GCScript JSON string to validate."),
   },
   async ({ gcscript }) => {
-    const issues: string[] = [];
+    const { valid, issues } = validateGcScript(gcscript);
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(gcscript);
-    } catch (e) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text" as const,
-            text: `Invalid JSON: ${e instanceof Error ? e.message : String(e)}`,
-          },
-        ],
-      };
-    }
-
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      issues.push("Root element must be a JSON object.");
-    } else {
-      const root = parsed as Record<string, unknown>;
-      if (!("type" in root)) {
-        issues.push("Root object is missing the required 'type' property.");
-      }
-      if (root["type"] === "script" && !("run" in root)) {
-        issues.push("Script blocks must have a 'run' property.");
-      }
-      // Warn about JS comments that are not valid JSON
-      if (gcscript.includes("//")) {
-        issues.push(
-          "Warning: GCScript comments (//) shown in documentation are illustrative only and are not valid JSON. Remove them before use."
-        );
-      }
-    }
-
-    if (issues.length === 0) {
+    if (valid) {
       return {
         content: [
           {
@@ -862,7 +700,9 @@ server.tool(
       };
     }
 
+    const isError = issues.some((i) => !i.startsWith("Warning:"));
     return {
+      isError,
       content: [
         {
           type: "text" as const,
@@ -911,9 +751,24 @@ server.tool(
         description: "Generate a stake delegation GCScript + URL.",
       },
       {
+        name: "list_examples",
+        description:
+          "List the 90+ built-in GCScript examples, optionally filtered by category.",
+      },
+      {
+        name: "get_example",
+        description:
+          "Retrieve a specific example by name and get its GCScript + URL.",
+      },
+      {
+        name: "search_examples",
+        description:
+          "Search examples by keywords (AND logic across name, title, description).",
+      },
+      {
         name: "get_documentation",
         description:
-          "Return documentation for a topic: overview, gcscript, isl, url-patterns, transactions, payments, minting, multisig, workspaces, examples, skills.",
+          "Return docs for a topic: overview, gcscript, isl, url-patterns, transactions, payments, minting, multisig, workspaces, examples, skills.",
       },
       {
         name: "validate_gcscript",
