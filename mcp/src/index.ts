@@ -6,7 +6,7 @@
  *  - Generate GCScript dapp connections (JSON)
  *  - Encode GCScript into wallet-ready URLs
  *  - Decode wallet response URLs
- *  - Browse and retrieve the 90+ built-in examples
+ *  - Browse and retrieve the 93 built-in examples
  *  - Query documentation and reference patterns
  */
 
@@ -314,7 +314,7 @@ server.tool(
 // ---------------------------------------------------------------------------
 server.tool(
   "list_examples",
-  "List the 90+ built-in GCScript example dapps from the repository. Optionally filter by category.",
+  "List the 93 built-in GCScript example dapps from the repository. Optionally filter by category.",
   {
     category: z
       .enum(ALL_CATEGORIES as [ExampleCategory, ...ExampleCategory[]])
@@ -652,7 +652,7 @@ List workspace items: getAddresses, getKeys.`,
 
       examples: `# Example Dapps
 
-90+ open source GCScript example dapps are bundled with this MCP server.
+93 open source GCScript example dapps are bundled with this MCP server.
 Use the list_examples, get_example, and search_examples tools to browse them.
 
 Categories:
@@ -753,7 +753,7 @@ server.tool(
       {
         name: "list_examples",
         description:
-          "List the 90+ built-in GCScript examples, optionally filtered by category.",
+          "List the 93 built-in GCScript examples, optionally filtered by category.",
       },
       {
         name: "get_example",

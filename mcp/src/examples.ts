@@ -1,7 +1,7 @@
 /**
  * GameChanger Wallet MCP Server — Examples Loader
  *
- * Reads and indexes the 90+ GCScript example files from the examples/ directory
+ * Reads and indexes the 93 GCScript example files from the examples/ directory
  * at the root of the repository. Each example is parsed and enriched with a
  * derived category so agents can browse, filter, and retrieve them.
  */

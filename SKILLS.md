@@ -534,7 +534,7 @@ gamechanger-cli decode msg -v 2 -m "1-H4sI..."
 | ISL | [docs/gcscript/ISL.md](docs/gcscript/ISL.md) |
 | Transactions | [docs/transactions/README.md](docs/transactions/README.md) |
 | Workspaces | [docs/workspaces/README.md](docs/workspaces/README.md) |
-| 70+ Example Dapps | [examples/README.md](examples/README.md) |
+| 93 Example Dapps | [examples/README.md](examples/README.md) |
 
 ---
 

@@ -6,6 +6,7 @@ AI agents connected to this server can:
 - Generate **GCScript** dapp connections (JSON) for common Cardano operations
 - Encode GCScript into **wallet-ready URLs** users can open
 - **Decode** wallet response payloads back into readable JSON
+- **Browse, search, and retrieve** the 93 built-in GCScript examples from the repository
 - Query **documentation** and reference information
 
 ---
@@ -88,6 +89,9 @@ Point to the server binary in your MCP configuration per the VS Code MCP documen
 | `generate_get_wallet_info` | Generate a wallet info retrieval GCScript + URL |
 | `generate_mint_token` | Generate a token / NFT minting GCScript + URL |
 | `generate_stake_delegation` | Generate a stake delegation GCScript + URL |
+| `list_examples` | List the 93 built-in GCScript examples, optionally filtered by category |
+| `get_example` | Retrieve a specific example by name — returns GCScript + URL |
+| `search_examples` | Search examples by keywords (AND logic across name, title, description) |
 | `get_documentation` | Return docs for a topic (gcscript, isl, payments, minting, …) |
 | `validate_gcscript` | Validate that a GCScript string is well-formed |
 | `list_tools` | List all available tools |
@@ -182,6 +186,40 @@ Generate a GCScript + URL for delegating the user's staking key to a pool.
 - `network` (enum, default: `mainnet`)
 
 **Returns:** `{ gcscript, url, network }`
+
+---
+
+### `list_examples`
+
+List the 93 built-in GCScript examples from the repository.
+
+**Parameters:**
+- `category` (enum, optional): filter by category — `payments` | `minting` | `multisig` | `governance` | `workspaces` | `smart-contracts` | `gcfs` | `wallet` | `keys` | `utility`
+
+**Returns:** `{ total, category, examples: [{ name, title, description, category }] }`
+
+---
+
+### `get_example`
+
+Retrieve a specific example by name. Returns the full GCScript JSON and an encoded wallet URL.
+
+**Parameters:**
+- `name` (string, required) — Example name as returned by `list_examples` or `search_examples` (case-insensitive)
+- `network` (enum, default: `mainnet`)
+
+**Returns:** `{ name, title, description, category, gcscript, url, network }`
+
+---
+
+### `search_examples`
+
+Search examples by keywords (AND logic across name, title, and description).
+
+**Parameters:**
+- `keywords` (string[], required, min 1) — e.g., `["nft", "mint"]` returns examples containing both keywords
+
+**Returns:** `{ keywords, total, results: [{ name, title, description, category }] }`
 
 ---
 
