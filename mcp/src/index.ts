@@ -33,6 +33,8 @@ import {
   type ExampleCategory,
 } from "./examples.js";
 
+import { registerExampleTools } from "./example-tools.js";
+
 // ---------------------------------------------------------------------------
 // MCP Server setup
 // ---------------------------------------------------------------------------
@@ -778,6 +780,13 @@ server.tool(
         name: "list_tools",
         description: "List all available MCP tools.",
       },
+      {
+        name: "example_<slug> (93 tools)",
+        description:
+          "One tool per built-in example, named example_<slug> (e.g. example_nft_minting_demo). " +
+          "Each tool accepts 'network' plus any example-specific parameters. " +
+          "Use list_examples or search_examples to discover example names, then call the matching tool.",
+      },
     ];
 
     return {
@@ -795,6 +804,9 @@ server.tool(
 // Start server
 // ---------------------------------------------------------------------------
 async function main() {
+  // Register one tool per built-in example (93 tools)
+  await registerExampleTools(server);
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write("GameChanger Wallet MCP Server running on stdio\n");
