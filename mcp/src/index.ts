@@ -1,0 +1,1048 @@
+#!/usr/bin/env node
+/**
+ * GameChanger Wallet MCP Server
+ *
+ * Exposes GameChanger Wallet capabilities as MCP tools so that AI agents can:
+ *  - Generate GCScript dapp connections (JSON)
+ *  - Encode GCScript into wallet-ready URLs
+ *  - Decode wallet response URLs
+ *  - Browse and retrieve the 93 built-in examples
+ *  - Query documentation and reference patterns
+ */
+
+import { createServer as createHttpServer, type IncomingMessage } from "node:http";
+import { randomUUID } from "node:crypto";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
+
+import {
+  encodeGcScriptUrl,
+  decodeGcResult,
+  validateGcScript,
+  buildSendAdaScript,
+  buildGetWalletInfoScript,
+  buildMintTokenScript,
+  buildMultiSendScript,
+  buildStakeDelegationScript,
+} from "./lib.js";
+
+import {
+  listExamples,
+  getExampleByName,
+  searchExamples,
+  ALL_CATEGORIES,
+  type ExampleCategory,
+} from "./examples.js";
+
+import { registerExampleTools } from "./example-tools.js";
+
+// ---------------------------------------------------------------------------
+// MCP Server factory
+// ---------------------------------------------------------------------------
+//
+// createConfiguredServer() creates a fresh McpServer with ALL tools registered,
+// including the 93 per-example tools.  It is called:
+//  • once at startup in stdio mode
+//  • once per session in HTTP mode (so every client gets its own McpServer)
+//
+// The inner `server` variable intentionally shadows the outer scope so that
+// none of the tool-registration code below needs to change.
+// ---------------------------------------------------------------------------
+
+async function createConfiguredServer(): Promise<McpServer> {
+// vvvvv  inner scope  vvvvv
+const server = new McpServer({
+  name: "gamechanger-wallet",
+  version: "1.0.0",
+});
+
+// ---------------------------------------------------------------------------
+// Tool: encode_gcscript_url
+// ---------------------------------------------------------------------------
+server.tool(
+  "encode_gcscript_url",
+  "Encode any GCScript JSON object into a GameChanger Wallet URL that can be opened by a user to execute the script.",
+  {
+    gcscript: z
+      .string()
+      .describe("GCScript as a JSON string (the script to encode into the URL)."),
+    network: z
+      .enum(["mainnet", "preprod"])
+      .default("mainnet")
+      .describe("Target Cardano network. Defaults to 'mainnet'."),
+  },
+  async ({ gcscript, network }) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(gcscript);
+    } catch {
+      return {
+        isError: true,
+        content: [{ type: "text" as const, text: "Invalid JSON provided for gcscript." }],
+      };
+    }
+
+    const url = encodeGcScriptUrl(parsed, network);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ url, network }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: decode_wallet_response
+// ---------------------------------------------------------------------------
+server.tool(
+  "decode_wallet_response",
+  "Decode a packed wallet response string (from a returnURL ?result= parameter) back to readable JSON.",
+  {
+    packed: z
+      .string()
+      .describe(
+        "The packed result value from the wallet response URL (e.g., the value of the 'result' query parameter)."
+      ),
+  },
+  async ({ packed }) => {
+    try {
+      const decoded = await decodeGcResult(packed);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(decoded, null, 2),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `Decoding failed: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: generate_send_ada
+// ---------------------------------------------------------------------------
+server.tool(
+  "generate_send_ada",
+  "Generate a GCScript that sends ADA from the user's wallet to a recipient address, and return the corresponding wallet URL.",
+  {
+    toAddress: z.string().describe("Recipient Cardano address (bech32)."),
+    lovelace: z
+      .string()
+      .describe(
+        "Amount to send in lovelace as a string (1 ADA = 1000000 lovelace)."
+      ),
+    network: z
+      .enum(["mainnet", "preprod"])
+      .default("mainnet")
+      .describe("Target Cardano network."),
+    title: z
+      .string()
+      .optional()
+      .describe("Optional human-readable title shown in the wallet UI."),
+    returnUrl: z
+      .string()
+      .optional()
+      .describe(
+        "Optional return URL pattern, e.g. 'https://myapp.example/callback?result={result}'. The wallet will redirect here after execution."
+      ),
+  },
+  async ({ toAddress, lovelace, network, title, returnUrl }) => {
+    const script = buildSendAdaScript({ toAddress, lovelace, title, returnUrl });
+    const url = encodeGcScriptUrl(script, network);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ gcscript: script, url, network }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: generate_multi_send
+// ---------------------------------------------------------------------------
+server.tool(
+  "generate_multi_send",
+  "Generate a GCScript that sends ADA to multiple recipients in a single Cardano transaction.",
+  {
+    outputs: z
+      .array(
+        z.object({
+          address: z.string().describe("Recipient Cardano address (bech32)."),
+          lovelace: z
+            .string()
+            .describe("Amount in lovelace as a string (1 ADA = 1000000 lovelace)."),
+        })
+      )
+      .min(1)
+      .describe("List of recipients with their addresses and amounts."),
+    network: z
+      .enum(["mainnet", "preprod"])
+      .default("mainnet")
+      .describe("Target Cardano network."),
+  },
+  async ({ outputs, network }) => {
+    const script = buildMultiSendScript(outputs);
+    const url = encodeGcScriptUrl(script, network);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ gcscript: script, url, network }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: generate_get_wallet_info
+// ---------------------------------------------------------------------------
+server.tool(
+  "generate_get_wallet_info",
+  "Generate a GCScript that retrieves the user's wallet name, current address, and network info.",
+  {
+    network: z
+      .enum(["mainnet", "preprod"])
+      .default("mainnet")
+      .describe("Target Cardano network."),
+    returnUrl: z
+      .string()
+      .optional()
+      .describe("Optional return URL pattern with {result} placeholder."),
+  },
+  async ({ network, returnUrl }) => {
+    const script = buildGetWalletInfoScript({ returnUrl });
+    const url = encodeGcScriptUrl(script, network);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ gcscript: script, url, network }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: generate_mint_token
+// ---------------------------------------------------------------------------
+server.tool(
+  "generate_mint_token",
+  "Generate a GCScript that mints native tokens using the user's spending key as the minting policy.",
+  {
+    assetName: z
+      .string()
+      .describe("The asset name (token name) to mint."),
+    quantity: z
+      .string()
+      .describe("Number of tokens to mint as a string (e.g., '1000')."),
+    network: z
+      .enum(["mainnet", "preprod"])
+      .default("mainnet")
+      .describe("Target Cardano network."),
+    toAddress: z
+      .string()
+      .optional()
+      .describe(
+        "Address to send minted tokens to. Defaults to the user's own spending address."
+      ),
+    nftMetadata: z
+      .record(z.unknown())
+      .optional()
+      .describe(
+        "Optional CIP-25 NFT metadata object to attach to the transaction under key '721'."
+      ),
+  },
+  async ({ assetName, quantity, network, toAddress, nftMetadata }) => {
+    const metadata = nftMetadata
+      ? ({ "721": { "<policyId>": { [assetName]: nftMetadata } } } as Record<string, unknown>)
+      : undefined;
+
+    const script = buildMintTokenScript({
+      assetName,
+      quantity,
+      toAddress,
+      metadata,
+    });
+    const url = encodeGcScriptUrl(script, network);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ gcscript: script, url, network }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: generate_stake_delegation
+// ---------------------------------------------------------------------------
+server.tool(
+  "generate_stake_delegation",
+  "Generate a GCScript that delegates the user's staking key to a Cardano stake pool.",
+  {
+    poolId: z
+      .string()
+      .describe("Stake pool ID in bech32 (pool1...) or hex format."),
+    network: z
+      .enum(["mainnet", "preprod"])
+      .default("mainnet")
+      .describe("Target Cardano network."),
+  },
+  async ({ poolId, network }) => {
+    const script = buildStakeDelegationScript(poolId);
+    const url = encodeGcScriptUrl(script, network);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ gcscript: script, url, network }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: list_examples
+// ---------------------------------------------------------------------------
+server.tool(
+  "list_examples",
+  "List the 93 built-in GCScript example dapps from the repository. Optionally filter by category.",
+  {
+    category: z
+      .enum(ALL_CATEGORIES as [ExampleCategory, ...ExampleCategory[]])
+      .optional()
+      .describe(
+        "Optional category filter. One of: " + ALL_CATEGORIES.join(", ")
+      ),
+  },
+  async ({ category }) => {
+    const examples = await listExamples(category);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              total: examples.length,
+              category: category ?? "all",
+              examples,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: get_example
+// ---------------------------------------------------------------------------
+server.tool(
+  "get_example",
+  "Retrieve a specific example by name. Returns the full GCScript JSON and an encoded wallet URL for immediate use.",
+  {
+    name: z
+      .string()
+      .describe(
+        "Example name (as returned by list_examples or search_examples). Case-insensitive."
+      ),
+    network: z
+      .enum(["mainnet", "preprod"])
+      .default("mainnet")
+      .describe("Target Cardano network for the encoded URL."),
+  },
+  async ({ name, network }) => {
+    const example = await getExampleByName(name);
+    if (!example) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text: `Example not found: "${name}". Use list_examples or search_examples to find available examples.`,
+          },
+        ],
+      };
+    }
+
+    const url = encodeGcScriptUrl(example.gcscript, network);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              name: example.name,
+              title: example.title,
+              description: example.description,
+              category: example.category,
+              gcscript: example.gcscript,
+              url,
+              network,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: search_examples
+// ---------------------------------------------------------------------------
+server.tool(
+  "search_examples",
+  "Search the built-in GCScript examples by keywords. Returns matching examples from name, title, and description.",
+  {
+    keywords: z
+      .array(z.string())
+      .min(1)
+      .describe(
+        "One or more search keywords (AND logic). Example: ['nft', 'mint'] returns examples mentioning both."
+      ),
+  },
+  async ({ keywords }) => {
+    const results = await searchExamples(keywords);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              keywords,
+              total: results.length,
+              results,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: get_documentation
+// ---------------------------------------------------------------------------
+server.tool(
+  "get_documentation",
+  "Return documentation, code examples, or reference information about a specific GameChanger Wallet topic.",
+  {
+    topic: z
+      .enum([
+        "overview",
+        "gcscript",
+        "isl",
+        "url-patterns",
+        "transactions",
+        "payments",
+        "minting",
+        "multisig",
+        "workspaces",
+        "examples",
+        "skills",
+      ])
+      .describe("Topic to retrieve documentation for."),
+  },
+  async ({ topic }) => {
+    const docs: Record<string, string> = {
+      overview: `# GameChanger Wallet Overview
+
+GameChanger Wallet is a non-custodial Cardano "meta wallet" that supports all major wallet types
+via a JSON-based scripting language (GCScript) delivered through URLs and QR codes.
+
+- Production URL: https://wallet.gamechanger.finance/
+- API Reference: https://wallet.gamechanger.finance/doc/api/v2
+- Playground IDE: https://wallet.gamechanger.finance/playground
+- NPM Library: https://www.npmjs.com/package/@gamechanger-finance/gc
+
+Supported networks: Cardano Mainnet, Pre-Production Testnet.
+Supported wallet types: seed phrases, Ledger, Trezor, Nami, Eternl, Flint, Vespr, CIP-30 extensions, multisig/shared treasury, QR/gift/burner wallets.`,
+
+      gcscript: `# GCScript DSL
+
+GCScript is a non-Turing-complete JSON-based domain-specific language interpreted by the GameChanger Wallet.
+
+## Basic structure
+Every construct is a JSON object with a "type" property naming the function.
+The top-level (and all container) function is "script". Its "run" property holds a map of child calls.
+
+\`\`\`json
+{
+  "type": "script",
+  "title": "My Dapp",
+  "exportAs": "results",
+  "run": {
+    "name":    { "type": "getName" },
+    "address": { "type": "getCurrentAddress" }
+  }
+}
+\`\`\`
+
+## Cache and exports
+- Each "script" block has a local "cache" storing child results.
+- Only results exported with "exportAs" reach the global "exports" object returned to dapps.
+
+## Key functions
+- data           — constant value
+- macro          — ISL expression evaluator
+- buildTx        — build a Cardano transaction
+- signTxs        — sign transaction(s)
+- submitTxs      — submit to Cardano node
+- getName        — wallet name
+- getCurrentAddress — current address
+- getSpendingPublicKey — spending public key
+- getNetworkInfo — DLT and network info
+- nativeScript   — build a native script
+
+API docs: https://wallet.gamechanger.finance/doc/api/v2`,
+
+      isl: `# Inline Scripting Language (ISL)
+
+ISL is a non-Turing-complete JavaScript subset embedded inside GCScript string arguments.
+Any string starting with { and ending with } is treated as ISL.
+
+## Reading cache values
+"{get('cache.build.txHex')}"
+
+## Common functions
+- get(path)           — read from cache (e.g. 'cache.build.txHex')
+- sha512(val)         — SHA-512 hash
+- sha256(val)         — SHA-256 hash
+- join(sep, ...parts) — string concatenation
+- uuid()              — generate UUID
+- return(val)         — explicit return
+- fail(msg)           — error halt
+
+## The macro function
+Use "type":"macro" to run ISL and produce a GCScript result:
+\`\`\`json
+{
+  "type": "macro",
+  "run": "{join('-', get('cache.networkInfo.dltTag'), get('cache.networkInfo.networkTag'))}"
+}
+\`\`\``,
+
+      "url-patterns": `# URL Patterns
+
+Base: https://wallet.gamechanger.finance/api/2/run/<payload>?networkTag=<network>
+
+## Encodings
+- 0-<base64url>   : no compression (fallback)
+- 1-<base64url>   : gzip compression (recommended)
+
+## Query parameters
+- networkTag=mainnet|preprod   : target network
+- dltTag=cardano               : target DLT
+- ref=<address>                : optional referrer
+
+## Return URLs
+Add returnURLPattern to script:
+\`\`\`json
+{ "returnURLPattern": "https://my-dapp.example/cb?result={result}" }
+\`\`\`
+The wallet replaces {result} with the encoded JSON results and redirects.
+
+## Generation
+Using NPM lib: gc.encode.url({ input: JSON.stringify(script), network: 'mainnet' })
+Using CLI:     gamechanger-cli mainnet encode url -v 2 -f script.gcscript`,
+
+      transactions: `# Cardano Transactions in GCScript
+
+All transactions follow build → sign → submit:
+
+\`\`\`json
+{
+  "build":  { "type": "buildTx",   "tx": { ... } },
+  "sign":   { "type": "signTxs",   "detailedPermissions": false, "txs": ["{get('cache.build.txHex')}"] },
+  "submit": { "type": "submitTxs", "txs": "{get('cache.sign')}" }
+}
+\`\`\`
+
+buildTx.tx supports: outputs, mints, certificates, withdrawals, auxiliaryData, collateral, inputs.
+ADA amounts are always in lovelace expressed as strings (1 ADA = "1000000").
+Multisig: add options.autoProvision.workspaceNativeScript and options.autoOptionalSigners.nativeScript.`,
+
+      payments: `# Payments
+
+An output defines who to pay, how much and what:
+\`\`\`json
+{
+  "address": "addr1q...",
+  "assets": [{ "policyId": "ada", "assetName": "ada", "quantity": "2000000" }]
+}
+\`\`\`
+
+- policyId + assetName = "ada" for ADA/tADA.
+- For native tokens set real policyId and assetName values.
+- quantity is always a BigNum string.
+- Multiple outputs in one tx are supported.`,
+
+      minting: `# Minting Tokens and NFTs
+
+Native assets require a minting policy (native script or Plutus script).
+Self-sovereign minting with user's own key:
+
+\`\`\`json
+{
+  "dependencies": {
+    "type": "script",
+    "run": {
+      "issuer":        { "type": "getSpendingPublicKey" },
+      "mintingPolicy": { "type": "nativeScript", "script": { "pubKeyHashHex": "{get('cache.dependencies.issuer.pubKeyHashHex')}" } }
+    }
+  },
+  "build": {
+    "type": "buildTx",
+    "tx": {
+      "mints": [{ "vkey": "...", "script": "...", "assets": [{"assetName":"Token","quantity":"1000"}] }]
+    }
+  }
+}
+\`\`\`
+
+NFT metadata follows CIP-25: auxiliaryData.721.<policyId>.<assetName>.`,
+
+      multisig: `# Multi-Signatures
+
+Native scripts support M-of-N signers:
+\`\`\`json
+{ "type": "atLeast", "required": 2, "scripts": [
+  { "pubKeyHashHex": "<key1>" },
+  { "pubKeyHashHex": "<key2>" },
+  { "pubKeyHashHex": "<key3>" }
+]}
+\`\`\`
+
+For seamless multisig in buildTx add:
+\`\`\`json
+"options": {
+  "autoProvision":     { "workspaceNativeScript": true },
+  "autoOptionalSigners": { "nativeScript": true }
+}
+\`\`\`
+
+Unimatrix Sync enables private obfuscated channels for coordinating multi-party signing without a central backend.`,
+
+      workspaces: `# Workspaces
+
+Workspaces are named collections of wallet artifacts (keys, addresses, native scripts).
+They allow multiple wallet types to coexist, be audited, shared, and recovered.
+
+Artifacts:
+- Keys (spending, staking, child keys)
+- Addresses (personal, multisig, script)
+- Native scripts
+
+Key derivation: getSpendingPublicKey, getStakingPublicKey accept account and index parameters.
+List workspace items: getAddresses, getKeys.`,
+
+      examples: `# Example Dapps
+
+93 open source GCScript example dapps are bundled with this MCP server.
+Use the list_examples, get_example, and search_examples tools to browse them.
+
+Categories:
+- payments       — ADA payments, stake delegation/withdrawal, transaction features
+- minting        — NFT and native token minting/burning
+- multisig       — Multi-signature flows (Kobayashi Maru, Shared Treasury, Unimatrix)
+- governance     — DRep, Vote Delegation, Abstain, No Confidence
+- workspaces     — Workspace configuration, key/address management
+- smart-contracts — Plutus V2/V3, Helios Language, Lock-and-Redeem
+- gcfs           — On-chain file system (GCFS), Dandelion Network
+- wallet         — Gift wallets, wallet type detection, derivation scripts
+- keys           — Key derivation formats and paths
+- utility        — Macros, ISL, cryptographic operations, code validation`,
+
+      skills: `See SKILLS.md at the root of this repository for a comprehensive AI agent skills reference covering GCScript, ISL, UDC, transactions, workspaces, patterns, and tooling.`,
+    };
+
+    const content = docs[topic] ?? `No documentation found for topic: ${topic}`;
+    return {
+      content: [{ type: "text" as const, text: content }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: validate_gcscript
+// ---------------------------------------------------------------------------
+server.tool(
+  "validate_gcscript",
+  "Validate that a GCScript string is well-formed JSON and has the required 'type' property on the root object.",
+  {
+    gcscript: z.string().describe("GCScript JSON string to validate."),
+  },
+  async ({ gcscript }) => {
+    const { valid, issues } = validateGcScript(gcscript);
+
+    if (valid) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "GCScript is valid. No issues found.",
+          },
+        ],
+      };
+    }
+
+    const isError = issues.some((i) => !i.startsWith("Warning:"));
+    return {
+      isError,
+      content: [
+        {
+          type: "text" as const,
+          text: `Validation issues:\n${issues.map((i) => `- ${i}`).join("\n")}`,
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: list_tools
+// ---------------------------------------------------------------------------
+server.tool(
+  "list_tools",
+  "List all available MCP tools provided by the GameChanger Wallet MCP server.",
+  {},
+  async () => {
+    const tools = [
+      {
+        name: "encode_gcscript_url",
+        description: "Encode any GCScript JSON object into a wallet-ready URL.",
+      },
+      {
+        name: "decode_wallet_response",
+        description: "Decode a packed wallet result string back to JSON.",
+      },
+      {
+        name: "generate_send_ada",
+        description: "Generate a send-ADA GCScript + URL.",
+      },
+      {
+        name: "generate_multi_send",
+        description: "Generate a multi-recipient ADA payment GCScript + URL.",
+      },
+      {
+        name: "generate_get_wallet_info",
+        description: "Generate a wallet info retrieval GCScript + URL.",
+      },
+      {
+        name: "generate_mint_token",
+        description: "Generate a token/NFT minting GCScript + URL.",
+      },
+      {
+        name: "generate_stake_delegation",
+        description: "Generate a stake delegation GCScript + URL.",
+      },
+      {
+        name: "list_examples",
+        description:
+          "List the 93 built-in GCScript examples, optionally filtered by category.",
+      },
+      {
+        name: "get_example",
+        description:
+          "Retrieve a specific example by name and get its GCScript + URL.",
+      },
+      {
+        name: "search_examples",
+        description:
+          "Search examples by keywords (AND logic across name, title, description).",
+      },
+      {
+        name: "get_documentation",
+        description:
+          "Return docs for a topic: overview, gcscript, isl, url-patterns, transactions, payments, minting, multisig, workspaces, examples, skills.",
+      },
+      {
+        name: "validate_gcscript",
+        description: "Validate that a GCScript string is well-formed.",
+      },
+      {
+        name: "list_tools",
+        description: "List all available MCP tools.",
+      },
+      {
+        name: "example_<slug> (93 tools)",
+        description:
+          "One tool per built-in example, named example_<slug> (e.g. example_nft_minting_demo). " +
+          "Each tool accepts 'network' plus any example-specific parameters. " +
+          "Use list_examples or search_examples to discover example names, then call the matching tool.",
+      },
+    ];
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(tools, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// End of createConfiguredServer() — close the factory function opened above
+// ---------------------------------------------------------------------------
+
+  // Register one tool per built-in example (93 tools)
+  await registerExampleTools(server);
+  return server;
+// ^^^^^  inner scope  ^^^^^
+} // end createConfiguredServer()
+
+// ---------------------------------------------------------------------------
+// CLI argument parsing helpers
+// ---------------------------------------------------------------------------
+
+interface CliArgs {
+  /** Run in HTTP mode instead of stdio */
+  http: boolean;
+  /** Port to listen on in HTTP mode (default: 3000) */
+  port: number;
+  /** Host to bind to in HTTP mode (default: 127.0.0.1) */
+  host: string;
+}
+
+function parseCliArgs(argv: string[]): CliArgs {
+  const args = argv.slice(2);
+  const http = args.includes("--http");
+  const portArg = args.find((a) => a.startsWith("--port="));
+  const hostArg = args.find((a) => a.startsWith("--host="));
+  const port = portArg ? parseInt(portArg.split("=")[1], 10) : 3000;
+  const host = hostArg ? hostArg.split("=")[1] : "127.0.0.1";
+  return { http, port, host };
+}
+
+// ---------------------------------------------------------------------------
+// Body-reading helper (plain Node.js — no express dependency)
+// ---------------------------------------------------------------------------
+
+function readRequestBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk: Buffer) => (raw += chunk.toString()));
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        resolve({}); // invalid JSON — let the transport reject it
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Start server
+// ---------------------------------------------------------------------------
+async function main() {
+  const cli = parseCliArgs(process.argv);
+
+  if (cli.http) {
+    // ── HTTP mode ─────────────────────────────────────────────────────────────
+    //
+    // Two MCP transports are served simultaneously so that both modern and
+    // legacy clients can connect:
+    //
+    //  • POST/GET /mcp  — MCP Streamable HTTP (new clients, e.g. Claude.ai)
+    //  • GET  /sse      — SSE transport (legacy clients, e.g. Claude Desktop)
+    //  • POST /message  — SSE message ingestion (used by the SSE transport)
+    //
+    // Each client (regardless of transport) gets its own isolated McpServer
+    // instance.  Session maps route follow-up requests to the right transport.
+
+    // ── Streamable HTTP sessions (keyed by mcp-session-id header) ────────────
+    const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
+
+    // ── SSE sessions (keyed by sessionId query param) ─────────────────────────
+    const sseTransports = new Map<string, SSEServerTransport>();
+
+    const httpServer = createHttpServer(async (req, res) => {
+      const url = new URL(req.url ?? "/", `http://${cli.host}:${cli.port}`);
+
+      // ── Health check ──────────────────────────────────────────────────────
+      if (url.pathname === "/" && req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "application/json" }).end(
+          JSON.stringify({
+            name: "gamechanger-wallet-mcp",
+            version: "1.0.0",
+            transports: {
+              streamableHttp: "/mcp",
+              sse: "/sse",
+            },
+            sessions: {
+              streamableHttp: streamableTransports.size,
+              sse: sseTransports.size,
+            },
+          })
+        );
+        return;
+      }
+
+      // ── Streamable HTTP endpoint ───────────────────────────────────────────
+      if (url.pathname === "/mcp") {
+        try {
+          const sessionId = req.headers["mcp-session-id"] as string | undefined;
+          const existing = sessionId ? streamableTransports.get(sessionId) : undefined;
+
+          if (existing) {
+            await existing.handleRequest(req, res);
+          } else {
+            const body = await readRequestBody(req);
+
+            if (!isInitializeRequest(body)) {
+              res.writeHead(400, { "Content-Type": "application/json" }).end(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  error: {
+                    code: -32000,
+                    message: "Bad Request: No valid session ID provided",
+                  },
+                  id: null,
+                })
+              );
+              return;
+            }
+
+            const sessionTransport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => randomUUID(),
+              onsessioninitialized: (sid) => {
+                streamableTransports.set(sid, sessionTransport);
+              },
+            });
+
+            sessionTransport.onclose = () => {
+              const sid = sessionTransport.sessionId;
+              if (sid) streamableTransports.delete(sid);
+            };
+
+            const sessionServer = await createConfiguredServer();
+            await sessionServer.connect(sessionTransport);
+            await sessionTransport.handleRequest(req, res, body);
+          }
+        } catch (err) {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" }).end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                error: { code: -32603, message: String(err) },
+                id: null,
+              })
+            );
+          }
+        }
+        return;
+      }
+
+      // ── SSE endpoint (GET /sse) — legacy clients ───────────────────────────
+      if (url.pathname === "/sse" && req.method === "GET") {
+        try {
+          const transport = new SSEServerTransport("/message", res);
+
+          transport.onclose = () => {
+            sseTransports.delete(transport.sessionId);
+          };
+
+          sseTransports.set(transport.sessionId, transport);
+
+          const sessionServer = await createConfiguredServer();
+          await sessionServer.connect(transport);
+          // connect() calls transport.start() which sends the SSE headers +
+          // the initial "endpoint" event, so nothing more to do here.
+        } catch (err) {
+          if (!res.headersSent) {
+            res.writeHead(500).end(String(err));
+          }
+        }
+        return;
+      }
+
+      // ── SSE message ingestion (POST /message) — legacy clients ────────────
+      if (url.pathname === "/message" && req.method === "POST") {
+        const sessionId = url.searchParams.get("sessionId") ?? "";
+        const transport = sseTransports.get(sessionId);
+
+        if (!transport) {
+          res.writeHead(404, { "Content-Type": "application/json" }).end(
+            JSON.stringify({ error: `No SSE session found for sessionId: ${sessionId}` })
+          );
+          return;
+        }
+
+        try {
+          await transport.handlePostMessage(req, res);
+        } catch (err) {
+          if (!res.headersSent) {
+            res.writeHead(500).end(String(err));
+          }
+        }
+        return;
+      }
+
+      res.writeHead(404).end("Not found");
+    });
+
+    httpServer.on("error", (err) => {
+      process.stderr.write(`HTTP server error: ${err}\n`);
+    });
+
+    await new Promise<void>((resolve) => {
+      httpServer.listen(cli.port, cli.host, () => {
+        process.stderr.write(
+          `GameChanger Wallet MCP Server (HTTP) listening on:\n` +
+          `  Streamable HTTP : http://${cli.host}:${cli.port}/mcp\n` +
+          `  SSE (legacy)    : http://${cli.host}:${cli.port}/sse\n`
+        );
+        resolve();
+      });
+    });
+
+  } else {
+    // ── Stdio mode (default) ─────────────────────────────────────────────────
+    const server = await createConfiguredServer();
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    process.stderr.write("GameChanger Wallet MCP Server running on stdio\n");
+  }
+}
+
+main().catch((err) => {
+  process.stderr.write(`Fatal error: ${err}\n`);
+  process.exit(1);
+});
