@@ -10,8 +10,12 @@
  *  - Query documentation and reference patterns
  */
 
+import { createServer as createHttpServer, type IncomingMessage } from "node:http";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import {
@@ -36,9 +40,20 @@ import {
 import { registerExampleTools } from "./example-tools.js";
 
 // ---------------------------------------------------------------------------
-// MCP Server setup
+// MCP Server factory
+// ---------------------------------------------------------------------------
+//
+// createConfiguredServer() creates a fresh McpServer with ALL tools registered,
+// including the 93 per-example tools.  It is called:
+//  • once at startup in stdio mode
+//  • once per session in HTTP mode (so every client gets its own McpServer)
+//
+// The inner `server` variable intentionally shadows the outer scope so that
+// none of the tool-registration code below needs to change.
 // ---------------------------------------------------------------------------
 
+async function createConfiguredServer(): Promise<McpServer> {
+// vvvvv  inner scope  vvvvv
 const server = new McpServer({
   name: "gamechanger-wallet",
   version: "1.0.0",
@@ -801,15 +816,171 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
+// End of createConfiguredServer() — close the factory function opened above
+// ---------------------------------------------------------------------------
+
+  // Register one tool per built-in example (93 tools)
+  await registerExampleTools(server);
+  return server;
+// ^^^^^  inner scope  ^^^^^
+} // end createConfiguredServer()
+
+// ---------------------------------------------------------------------------
+// CLI argument parsing helpers
+// ---------------------------------------------------------------------------
+
+interface CliArgs {
+  /** Run in HTTP mode instead of stdio */
+  http: boolean;
+  /** Port to listen on in HTTP mode (default: 3000) */
+  port: number;
+  /** Host to bind to in HTTP mode (default: 127.0.0.1) */
+  host: string;
+}
+
+function parseCliArgs(argv: string[]): CliArgs {
+  const args = argv.slice(2);
+  const http = args.includes("--http");
+  const portArg = args.find((a) => a.startsWith("--port="));
+  const hostArg = args.find((a) => a.startsWith("--host="));
+  const port = portArg ? parseInt(portArg.split("=")[1], 10) : 3000;
+  const host = hostArg ? hostArg.split("=")[1] : "127.0.0.1";
+  return { http, port, host };
+}
+
+// ---------------------------------------------------------------------------
+// Body-reading helper (plain Node.js — no express dependency)
+// ---------------------------------------------------------------------------
+
+function readRequestBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk: Buffer) => (raw += chunk.toString()));
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        resolve({}); // invalid JSON — let the transport reject it
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Start server
 // ---------------------------------------------------------------------------
 async function main() {
-  // Register one tool per built-in example (93 tools)
-  await registerExampleTools(server);
+  const cli = parseCliArgs(process.argv);
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  process.stderr.write("GameChanger Wallet MCP Server running on stdio\n");
+  if (cli.http) {
+    // ── HTTP mode: Streamable HTTP transport with multi-session support ───────
+    //
+    // Each MCP client initializes its own session (mcp-session-id).
+    // A fresh McpServer + StreamableHTTPServerTransport is created per session
+    // so that tool state is fully isolated between clients.
+    // The session map routes subsequent requests to the correct transport.
+
+    const transports = new Map<string, StreamableHTTPServerTransport>();
+
+    const httpServer = createHttpServer(async (req, res) => {
+      const url = new URL(req.url ?? "/", `http://${cli.host}:${cli.port}`);
+
+      // ── Health check ──────────────────────────────────────────────────────
+      if (url.pathname === "/" && req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "application/json" }).end(
+          JSON.stringify({
+            name: "gamechanger-wallet-mcp",
+            version: "1.0.0",
+            transport: "streamable-http",
+            endpoint: "/mcp",
+            sessions: transports.size,
+          })
+        );
+        return;
+      }
+
+      // ── MCP endpoint ──────────────────────────────────────────────────────
+      if (url.pathname === "/mcp") {
+        try {
+          const sessionId = req.headers["mcp-session-id"] as string | undefined;
+          let transport = sessionId ? transports.get(sessionId) : undefined;
+
+          if (transport) {
+            // Existing session — reuse the transport
+            await transport.handleRequest(req, res);
+          } else {
+            // No valid session ID — expect an initialize request
+            const body = await readRequestBody(req);
+
+            if (!isInitializeRequest(body)) {
+              res.writeHead(400, { "Content-Type": "application/json" }).end(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  error: {
+                    code: -32000,
+                    message: "Bad Request: No valid session ID provided",
+                  },
+                  id: null,
+                })
+              );
+              return;
+            }
+
+            // New session: create a dedicated server + transport
+            const sessionTransport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => randomUUID(),
+              onsessioninitialized: (sid) => {
+                transports.set(sid, sessionTransport);
+              },
+            });
+
+            sessionTransport.onclose = () => {
+              const sid = sessionTransport.sessionId;
+              if (sid) transports.delete(sid);
+            };
+
+            const sessionServer = await createConfiguredServer();
+            await sessionServer.connect(sessionTransport);
+            await sessionTransport.handleRequest(req, res, body);
+          }
+        } catch (err) {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" }).end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                error: { code: -32603, message: String(err) },
+                id: null,
+              })
+            );
+          }
+        }
+        return;
+      }
+
+      res.writeHead(404).end("Not found");
+    });
+
+    httpServer.on("error", (err) => {
+      process.stderr.write(`HTTP server error: ${err}\n`);
+    });
+
+    await new Promise<void>((resolve) => {
+      httpServer.listen(cli.port, cli.host, () => {
+        process.stderr.write(
+          `GameChanger Wallet MCP Server (HTTP) listening on http://${cli.host}:${cli.port}/mcp\n`
+        );
+        resolve();
+      });
+    });
+
+  } else {
+    // ── Stdio mode (default) ─────────────────────────────────────────────────
+    const server = await createConfiguredServer();
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    process.stderr.write("GameChanger Wallet MCP Server running on stdio\n");
+  }
 }
 
 main().catch((err) => {
