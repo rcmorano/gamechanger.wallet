@@ -16,6 +16,7 @@ import http, { type IncomingMessage, type Server } from "node:http";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
@@ -106,14 +107,18 @@ function readBody(req: IncomingMessage): Promise<unknown> {
 }
 
 function startTestServer(): Promise<{ port: number; close: () => Promise<void> }> {
-  const transports = new Map<string, StreamableHTTPServerTransport>();
+  const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
+  const sseTransports = new Map<string, SSEServerTransport>();
 
   const server: Server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
 
     if (url.pathname === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" }).end(
-        JSON.stringify({ name: "gamechanger-wallet-mcp", endpoint: "/mcp" })
+        JSON.stringify({
+          name: "gamechanger-wallet-mcp",
+          transports: { streamableHttp: "/mcp", sse: "/sse" },
+        })
       );
       return;
     }
@@ -121,7 +126,7 @@ function startTestServer(): Promise<{ port: number; close: () => Promise<void> }
     if (url.pathname === "/mcp") {
       try {
         const sessionId = req.headers["mcp-session-id"] as string | undefined;
-        const existing = sessionId ? transports.get(sessionId) : undefined;
+        const existing = sessionId ? streamableTransports.get(sessionId) : undefined;
 
         if (existing) {
           await existing.handleRequest(req, res);
@@ -144,13 +149,13 @@ function startTestServer(): Promise<{ port: number; close: () => Promise<void> }
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid) => {
-            transports.set(sid, transport);
+            streamableTransports.set(sid, transport);
           },
         });
 
         transport.onclose = () => {
           const sid = transport.sessionId;
-          if (sid) transports.delete(sid);
+          if (sid) streamableTransports.delete(sid);
         };
 
         const mcpServer = new McpServer({ name: "test-gamechanger", version: "0.0.1" });
@@ -165,6 +170,51 @@ function startTestServer(): Promise<{ port: number; close: () => Promise<void> }
       } catch (err) {
         if (!res.headersSent) {
           res.writeHead(500).end(JSON.stringify({ error: String(err) }));
+        }
+      }
+      return;
+    }
+
+    // SSE endpoint (legacy clients)
+    if (url.pathname === "/sse" && req.method === "GET") {
+      try {
+        const transport = new SSEServerTransport("/message", res);
+
+        transport.onclose = () => {
+          sseTransports.delete(transport.sessionId);
+        };
+
+        sseTransports.set(transport.sessionId, transport);
+
+        const mcpServer = new McpServer({ name: "test-gamechanger", version: "0.0.1" });
+        mcpServer.tool(
+          "ping",
+          "Returns pong",
+          { message: z.string().optional() },
+          async () => ({ content: [{ type: "text" as const, text: "pong" }] })
+        );
+        await mcpServer.connect(transport);
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(500).end(String(err));
+        }
+      }
+      return;
+    }
+
+    // SSE message ingestion
+    if (url.pathname === "/message" && req.method === "POST") {
+      const sessionId = url.searchParams.get("sessionId") ?? "";
+      const transport = sseTransports.get(sessionId);
+      if (!transport) {
+        res.writeHead(404).end(JSON.stringify({ error: `No SSE session: ${sessionId}` }));
+        return;
+      }
+      try {
+        await transport.handlePostMessage(req, res);
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(500).end(String(err));
         }
       }
       return;
@@ -279,12 +329,15 @@ describe("HTTP transport — health check and routing", () => {
     assert.ok(port > 0, `Expected a positive port number, got ${port}`);
   });
 
-  it("GET / returns JSON with name and endpoint", async () => {
+  it("GET / returns JSON with name and transport endpoints", async () => {
     const { status, body } = await httpGet(port, "/");
     assert.equal(status, 200);
-    const json = JSON.parse(body) as Record<string, string>;
+    const json = JSON.parse(body) as Record<string, unknown>;
     assert.equal(json["name"], "gamechanger-wallet-mcp");
-    assert.ok(json["endpoint"], "Should have an endpoint field");
+    const transports = json["transports"] as Record<string, string> | undefined;
+    assert.ok(transports, "Should have a transports field");
+    assert.ok(transports["streamableHttp"], "Should list the streamableHttp endpoint");
+    assert.ok(transports["sse"], "Should list the SSE endpoint");
   });
 
   it("GET /unknown-path returns 404", async () => {
@@ -367,5 +420,160 @@ describe("HTTP transport — MCP initialize handshake", () => {
       notifResp.status === 200 || notifResp.status === 202,
       `Expected 200 or 202 for notification, got ${notifResp.status}`
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SSE transport integration tests (legacy clients like Claude Desktop)
+// ---------------------------------------------------------------------------
+
+/**
+ * Open an SSE connection to the test server.
+ * Returns:
+ *  - `sessionId`  — extracted from the first "endpoint" event
+ *  - `events`     — array of raw "data:" lines received so far
+ *  - `close()`    — destroys the underlying socket
+ */
+function openSseConnection(port: number): Promise<{
+  sessionId: string;
+  messageEndpoint: string;
+  events: string[];
+  close: () => void;
+}> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: "127.0.0.1", port, path: "/sse", method: "GET" },
+      (res: IncomingMessage) => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`GET /sse returned ${res.statusCode}`));
+          return;
+        }
+        const ct = res.headers["content-type"] ?? "";
+        if (!ct.includes("text/event-stream")) {
+          reject(
+            new Error(`Expected content-type text/event-stream, got: ${ct}`)
+          );
+          return;
+        }
+
+        const events: string[] = [];
+        let resolved = false;
+        let buf = "";
+
+        res.on("data", (chunk: Buffer) => {
+          buf += chunk.toString();
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (line.startsWith("data:")) {
+              const value = line.slice(5).trim();
+              events.push(value);
+
+              if (!resolved && value.startsWith("/message")) {
+                resolved = true;
+                const u = new URL(value, "http://127.0.0.1");
+                const sessionId = u.searchParams.get("sessionId") ?? "";
+                resolve({
+                  sessionId,
+                  messageEndpoint: value,
+                  events,
+                  close: () => res.destroy(),
+                });
+              }
+            }
+          }
+        });
+
+        res.on("error", reject);
+      }
+    );
+
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+describe("HTTP transport — SSE (legacy) endpoint", () => {
+  let port = 0;
+  let closeServer: () => Promise<void>;
+
+  before(async () => {
+    const s = await startTestServer();
+    port = s.port;
+    closeServer = s.close;
+  });
+
+  after(async () => {
+    await closeServer?.();
+  });
+
+  it("GET /sse responds with Content-Type: text/event-stream", async () => {
+    const { close } = await openSseConnection(port);
+    close();
+  });
+
+  it("GET /sse endpoint event contains a /message URL with a sessionId", async () => {
+    const { sessionId, messageEndpoint, close } = await openSseConnection(port);
+    assert.ok(
+      typeof sessionId === "string" && sessionId.length > 0,
+      "SSE endpoint event should carry a sessionId"
+    );
+    assert.ok(
+      messageEndpoint.startsWith("/message"),
+      `messageEndpoint should start with /message, got: ${messageEndpoint}`
+    );
+    close();
+  });
+
+  it("POST /message with valid sessionId returns 202 Accepted", async () => {
+    const { sessionId, close } = await openSseConnection(port);
+
+    const initBody = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        clientInfo: { name: "sse-test-client", version: "0.0.1" },
+        capabilities: {},
+      },
+    };
+
+    const { status } = await httpPost(
+      port,
+      `/message?sessionId=${sessionId}`,
+      initBody
+    );
+    assert.equal(status, 202, "SSE POST /message should return 202 Accepted");
+
+    close();
+  });
+
+  it("POST /message with unknown sessionId returns 404", async () => {
+    const { status } = await httpPost(
+      port,
+      `/message?sessionId=nonexistent-session-id`,
+      { jsonrpc: "2.0", id: 1, method: "ping", params: {} }
+    );
+    assert.equal(status, 404, "Unknown sessionId should return 404");
+  });
+
+  it("two concurrent SSE connections each get distinct session IDs", async () => {
+    const [c1, c2] = await Promise.all([
+      openSseConnection(port),
+      openSseConnection(port),
+    ]);
+
+    assert.ok(c1.sessionId.length > 0, "Connection 1 should have a sessionId");
+    assert.ok(c2.sessionId.length > 0, "Connection 2 should have a sessionId");
+    assert.notEqual(
+      c1.sessionId,
+      c2.sessionId,
+      "Concurrent SSE connections should have distinct session IDs"
+    );
+
+    c1.close();
+    c2.close();
   });
 });

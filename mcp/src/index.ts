@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
@@ -874,14 +875,23 @@ async function main() {
   const cli = parseCliArgs(process.argv);
 
   if (cli.http) {
-    // ── HTTP mode: Streamable HTTP transport with multi-session support ───────
+    // ── HTTP mode ─────────────────────────────────────────────────────────────
     //
-    // Each MCP client initializes its own session (mcp-session-id).
-    // A fresh McpServer + StreamableHTTPServerTransport is created per session
-    // so that tool state is fully isolated between clients.
-    // The session map routes subsequent requests to the correct transport.
+    // Two MCP transports are served simultaneously so that both modern and
+    // legacy clients can connect:
+    //
+    //  • POST/GET /mcp  — MCP Streamable HTTP (new clients, e.g. Claude.ai)
+    //  • GET  /sse      — SSE transport (legacy clients, e.g. Claude Desktop)
+    //  • POST /message  — SSE message ingestion (used by the SSE transport)
+    //
+    // Each client (regardless of transport) gets its own isolated McpServer
+    // instance.  Session maps route follow-up requests to the right transport.
 
-    const transports = new Map<string, StreamableHTTPServerTransport>();
+    // ── Streamable HTTP sessions (keyed by mcp-session-id header) ────────────
+    const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
+
+    // ── SSE sessions (keyed by sessionId query param) ─────────────────────────
+    const sseTransports = new Map<string, SSEServerTransport>();
 
     const httpServer = createHttpServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://${cli.host}:${cli.port}`);
@@ -892,25 +902,28 @@ async function main() {
           JSON.stringify({
             name: "gamechanger-wallet-mcp",
             version: "1.0.0",
-            transport: "streamable-http",
-            endpoint: "/mcp",
-            sessions: transports.size,
+            transports: {
+              streamableHttp: "/mcp",
+              sse: "/sse",
+            },
+            sessions: {
+              streamableHttp: streamableTransports.size,
+              sse: sseTransports.size,
+            },
           })
         );
         return;
       }
 
-      // ── MCP endpoint ──────────────────────────────────────────────────────
+      // ── Streamable HTTP endpoint ───────────────────────────────────────────
       if (url.pathname === "/mcp") {
         try {
           const sessionId = req.headers["mcp-session-id"] as string | undefined;
-          let transport = sessionId ? transports.get(sessionId) : undefined;
+          const existing = sessionId ? streamableTransports.get(sessionId) : undefined;
 
-          if (transport) {
-            // Existing session — reuse the transport
-            await transport.handleRequest(req, res);
+          if (existing) {
+            await existing.handleRequest(req, res);
           } else {
-            // No valid session ID — expect an initialize request
             const body = await readRequestBody(req);
 
             if (!isInitializeRequest(body)) {
@@ -927,17 +940,16 @@ async function main() {
               return;
             }
 
-            // New session: create a dedicated server + transport
             const sessionTransport = new StreamableHTTPServerTransport({
               sessionIdGenerator: () => randomUUID(),
               onsessioninitialized: (sid) => {
-                transports.set(sid, sessionTransport);
+                streamableTransports.set(sid, sessionTransport);
               },
             });
 
             sessionTransport.onclose = () => {
               const sid = sessionTransport.sessionId;
-              if (sid) transports.delete(sid);
+              if (sid) streamableTransports.delete(sid);
             };
 
             const sessionServer = await createConfiguredServer();
@@ -958,6 +970,51 @@ async function main() {
         return;
       }
 
+      // ── SSE endpoint (GET /sse) — legacy clients ───────────────────────────
+      if (url.pathname === "/sse" && req.method === "GET") {
+        try {
+          const transport = new SSEServerTransport("/message", res);
+
+          transport.onclose = () => {
+            sseTransports.delete(transport.sessionId);
+          };
+
+          sseTransports.set(transport.sessionId, transport);
+
+          const sessionServer = await createConfiguredServer();
+          await sessionServer.connect(transport);
+          // connect() calls transport.start() which sends the SSE headers +
+          // the initial "endpoint" event, so nothing more to do here.
+        } catch (err) {
+          if (!res.headersSent) {
+            res.writeHead(500).end(String(err));
+          }
+        }
+        return;
+      }
+
+      // ── SSE message ingestion (POST /message) — legacy clients ────────────
+      if (url.pathname === "/message" && req.method === "POST") {
+        const sessionId = url.searchParams.get("sessionId") ?? "";
+        const transport = sseTransports.get(sessionId);
+
+        if (!transport) {
+          res.writeHead(404, { "Content-Type": "application/json" }).end(
+            JSON.stringify({ error: `No SSE session found for sessionId: ${sessionId}` })
+          );
+          return;
+        }
+
+        try {
+          await transport.handlePostMessage(req, res);
+        } catch (err) {
+          if (!res.headersSent) {
+            res.writeHead(500).end(String(err));
+          }
+        }
+        return;
+      }
+
       res.writeHead(404).end("Not found");
     });
 
@@ -968,7 +1025,9 @@ async function main() {
     await new Promise<void>((resolve) => {
       httpServer.listen(cli.port, cli.host, () => {
         process.stderr.write(
-          `GameChanger Wallet MCP Server (HTTP) listening on http://${cli.host}:${cli.port}/mcp\n`
+          `GameChanger Wallet MCP Server (HTTP) listening on:\n` +
+          `  Streamable HTTP : http://${cli.host}:${cli.port}/mcp\n` +
+          `  SSE (legacy)    : http://${cli.host}:${cli.port}/sse\n`
         );
         resolve();
       });
